@@ -1,0 +1,99 @@
+{
+  "timestamp": "20250728_200000",
+  "results": {
+    "Idle": {
+      "status": "idle"
+    },
+    "1 Flow": {
+      "avg_time": 0.2604151964187622,
+      "min_time": 0.17106914520263672,
+      "max_time": 0.3497612476348877,
+      "total_requests": 2,
+      "success_rate": 100.0
+    },
+    "10 Flows": {
+      "avg_time": 2.4743940114974974,
+      "min_time": 1.3667480945587158,
+      "max_time": 3.760798454284668,
+      "total_requests": 20,
+      "success_rate": 100.0
+    },
+    "20 Flows": {
+      "avg_time": 3.1101586520671844,
+      "min_time": 2.2058677673339844,
+      "max_time": 3.9039242267608643,
+      "total_requests": 40,
+      "success_rate": 100.0
+    }
+  },
+  "baseline_stats": [
+    {
+      "BlockIO": "0B / 0B",
+      "CPUPerc": "70.31%",
+      "Container": "9d5c047a687a",
+      "ID": "9d5c047a687a",
+      "MemPerc": "15.35%",
+      "MemUsage": "1.167GiB / 7.604GiB",
+      "Name": "langflow-main",
+      "NetIO": "6.64MB / 7.27MB",
+      "PIDs": "108"
+    },
+    {
+      "BlockIO": "0B / 0B",
+      "CPUPerc": "0.00%",
+      "Container": "a24c9e9d9c58",
+      "ID": "a24c9e9d9c58",
+      "MemPerc": "0.11%",
+      "MemUsage": "8.195MiB / 7.604GiB",
+      "Name": "langflow-nginx",
+      "NetIO": "270kB / 282kB",
+      "PIDs": "2"
+    },
+    {
+      "BlockIO": "0B / 0B",
+      "CPUPerc": "0.60%",
+      "Container": "6cf051ff4216",
+      "ID": "6cf051ff4216",
+      "MemPerc": "21.18%",
+      "MemUsage": "1.611GiB / 7.604GiB",
+      "Name": "langflow-runner1",
+      "NetIO": "1.02MB / 168kB",
+      "PIDs": "177"
+    }
+  ],
+  "final_stats": [
+    {
+      "BlockIO": "0B / 0B",
+      "CPUPerc": "69.92%",
+      "Container": "9d5c047a687a",
+      "ID": "9d5c047a687a",
+      "MemPerc": "15.75%",
+      "MemUsage": "1.198GiB / 7.604GiB",
+      "Name": "langflow-main",
+      "NetIO": "6.74MB / 7.49MB",
+      "PIDs": "108"
+    },
+    {
+      "BlockIO": "0B / 0B",
+      "CPUPerc": "0.00%",
+      "Container": "a24c9e9d9c58",
+      "ID": "a24c9e9d9c58",
+      "MemPerc": "0.11%",
+      "MemUsage": "8.25MiB / 7.604GiB",
+      "Name": "langflow-nginx",
+      "NetIO": "353kB / 369kB",
+      "PIDs": "2"
+    },
+    {
+      "BlockIO": "0B / 0B",
+      "CPUPerc": "1.14%",
+      "Container": "6cf051ff4216",
+      "ID": "6cf051ff4216",
+      "MemPerc": "21.18%",
+      "MemUsage": "1.611GiB / 7.604GiB",
+      "Name": "langflow-runner1",
+      "NetIO": "1.08MB / 200kB",
+      "PIDs": "177"
+    }
+  ]
+}

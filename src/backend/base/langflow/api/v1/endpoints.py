@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
+import httpx
 import sqlalchemy as sa
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from loguru import logger
 from sqlmodel import select
 
@@ -55,6 +57,58 @@ if TYPE_CHECKING:
     from langflow.services.settings.service import SettingsService
 
 router = APIRouter(tags=["Base"])
+
+
+async def forward_flow_request(request: Request, flow_id_or_name: str, input_request: SimplifiedAPIRequest | None = None, stream: bool = False, api_key_user: UserRead | None = None) -> Response:
+    """Forward flow execution request to Nginx load balancer."""
+    forward_flow = os.getenv("FORWARD_FLOW", "false").lower() == "true"
+    forward_url = os.getenv("FORWARD_FLOW_URL", "")
+    
+    if not forward_flow or not forward_url:
+        return None
+    
+    try:
+        # Prepare the request body
+        body_data = {}
+        if input_request:
+            body_data = input_request.model_dump()
+        
+        # Prepare headers
+        headers = dict(request.headers)
+        headers_to_remove = ["host", "content-length", "transfer-encoding"]
+        for header in headers_to_remove:
+            headers.pop(header.lower(), None)
+        
+        # Add API key if available
+        if api_key_user and hasattr(api_key_user, 'api_key'):
+            headers["x-api-key"] = api_key_user.api_key
+        
+        # Build the target URL
+        target_url = f"{forward_url}"
+        if request.url.query:
+            target_url += f"?{request.url.query}"
+        
+        logger.info(f"Forwarding flow request to: {target_url}")
+        
+        # Make the request to Nginx
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url=target_url,
+                headers=headers,
+                json=body_data
+            )
+            
+            # Return the response from Nginx
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.headers.get("content-type")
+            )
+            
+    except Exception as e:
+        logger.error(f"Error forwarding request to {forward_url}: {e}")
+        return None
 
 
 @router.get("/all", dependencies=[Depends(get_current_active_user)])
@@ -270,6 +324,7 @@ async def run_flow_generator(
 @router.post("/run/{flow_id_or_name}", response_model=None, response_model_exclude_none=True)
 async def simplified_run_flow(
     *,
+    request: Request,
     background_tasks: BackgroundTasks,
     flow: Annotated[FlowRead | None, Depends(get_flow_by_id_or_endpoint_name)],
     input_request: SimplifiedAPIRequest | None = None,
@@ -309,6 +364,19 @@ async def simplified_run_flow(
     """
     telemetry_service = get_telemetry_service()
     input_request = input_request if input_request is not None else SimplifiedAPIRequest()
+    
+    # Check if forwarding is enabled and attempt to forward the request
+    forwarded_response = await forward_flow_request(
+        request=request,
+        flow_id_or_name=flow.id if flow else "",
+        input_request=input_request,
+        stream=stream,
+        api_key_user=api_key_user
+    )
+    
+    if forwarded_response:
+        return forwarded_response
+    
     if flow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Flow not found")
     start_time = time.perf_counter()
@@ -412,6 +480,19 @@ async def webhook_run_flow(
     telemetry_service = get_telemetry_service()
     start_time = time.perf_counter()
     logger.debug("Received webhook request")
+    
+    # Check if forwarding is enabled and attempt to forward the request
+    forwarded_response = await forward_flow_request(
+        request=request,
+        flow_id_or_name=flow.id if flow else "",
+        input_request=None,
+        stream=False,
+        api_key_user=user
+    )
+    
+    if forwarded_response:
+        return forwarded_response
+    
     error_msg = ""
     try:
         try:
@@ -470,6 +551,7 @@ async def webhook_run_flow(
 )
 async def experimental_run_flow(
     *,
+    request: Request,
     session: DbSession,
     flow_id: UUID,
     inputs: list[InputValueRequest] | None = None,
@@ -525,6 +607,37 @@ async def experimental_run_flow(
     This endpoint facilitates complex flow executions with customized inputs, outputs, and configurations,
     catering to diverse application requirements.
     """  # noqa: E501
+    
+    # Check if forwarding is enabled and attempt to forward the request
+    # For advanced run, we need to construct a SimplifiedAPIRequest from the inputs
+    if inputs and len(inputs) > 0:
+        input_request = SimplifiedAPIRequest(
+            input_value=inputs[0].input_value if inputs[0].input_value else "",
+            input_type="text",
+            output_type="any",
+            tweaks=tweaks or {},
+            session_id=session_id
+        )
+    else:
+        input_request = SimplifiedAPIRequest(
+            input_value="",
+            input_type="text",
+            output_type="any",
+            tweaks=tweaks or {},
+            session_id=session_id
+        )
+    
+    forwarded_response = await forward_flow_request(
+        request=request,
+        flow_id_or_name=str(flow_id),
+        input_request=input_request,
+        stream=stream,
+        api_key_user=api_key_user
+    )
+    
+    if forwarded_response:
+        return forwarded_response
+    
     session_service = get_session_service()
     flow_id_str = str(flow_id)
     if outputs is None:

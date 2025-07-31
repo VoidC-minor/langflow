@@ -1,37 +1,32 @@
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any
-
-from asgiref.sync import async_to_sync
-from celery.exceptions import SoftTimeLimitExceeded
-
-from langflow.core.celery_app import celery_app
-
-if TYPE_CHECKING:
-    from langflow.graph.vertex.base import Vertex
+import os
+from langflow.main import create_app
+from langflow.logging.logger import configure
 
 
-@celery_app.task(acks_late=True)
-def test_celery(word: str) -> str:
-    return f"test task return {word}"
+def setup_worker_environment():
+    """Setup environment for worker backend."""
+    # Set backend-only mode
+    os.environ["LANGFLOW_BACKEND_ONLY"] = "true"
+    
+    # Set worker port if specified
+    worker_port = os.getenv("LANGFLOW_WORKER_PORT", "7861")
+    os.environ["LANGFLOW_WORKER_PORT"] = worker_port
 
 
-@celery_app.task(bind=True, soft_time_limit=30, max_retries=3)
-def build_vertex(self, vertex: Vertex) -> Vertex:
-    """Build a vertex.
-
-    Returns:
-        The built vertex.
-    """
-    try:
-        vertex.task_id = self.request.id
-        async_to_sync(vertex.build)()
-    except SoftTimeLimitExceeded as e:
-        raise self.retry(exc=SoftTimeLimitExceeded("Task took too long"), countdown=2) from e
-    return vertex
-
-
-@celery_app.task(acks_late=True)
-def process_graph_cached_task() -> dict[str, Any]:
-    msg = "This task is not implemented yet"
-    raise NotImplementedError(msg)
+def create_worker_app():
+    """Create the worker FastAPI app."""
+    setup_worker_environment()
+    
+    # Configure logging
+    log_level = os.environ.get("LANGFLOW_LOG_LEVEL", "info")
+    configure(log_level=log_level)
+    
+    # Create the app using the main app creation logic
+    app = create_app()
+    
+    # Add health check endpoint for worker
+    @app.get("/api/v1/health")
+    async def health_check():
+        return {"status": "ok", "type": "worker"}
+    
+    return app
