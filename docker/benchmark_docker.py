@@ -78,7 +78,7 @@ class DockerBenchmark:
                 try:
                     response = await client.post(
                         f"{self.main_url}/api/v1/run/{flow_id}",
-                        json={"input_value": "test", "input_type": "chat"}
+                        json={"input_value": "hello", "input_type": "chat"}
                     )
                     elapsed = time.time() - start
                     if response.status_code == 200:
@@ -109,7 +109,7 @@ class DockerBenchmark:
         
         return times
     
-    async def benchmark(self, flow_id="66320748-0074-483a-875f-eac936a0b156"):
+    async def benchmark(self, flow_id="841009ce-bb47-4661-b64e-f865461701a2"):
         """Run the complete benchmark."""
         console.print(Panel.fit(" Docker Single Runner Benchmark", style="bold blue"))
         
@@ -128,6 +128,7 @@ class DockerBenchmark:
             ("1 Flow", 1),
             ("50 Flows", 50),
             ("100 Flows", 100),
+            ("500 Flows", 500),
         ]
         
         for scenario_name, n_parallel in scenarios:

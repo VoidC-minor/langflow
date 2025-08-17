@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     build-essential \
     git \
+    libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the entire project first
@@ -16,7 +17,8 @@ COPY . .
 # Install uv and Python dependencies
 RUN pip install --upgrade pip && \
     pip install uv && \
-    uv sync --frozen
+    uv sync --frozen --extra postgresql && \
+    pip install --no-cache-dir "psycopg[binary]"
 
 # Create data directory
 RUN mkdir -p /app/data

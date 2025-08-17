@@ -83,27 +83,83 @@ async def forward_flow_request(request: Request, flow_id_or_name: str, input_req
         if api_key_user and hasattr(api_key_user, 'api_key'):
             headers["x-api-key"] = api_key_user.api_key
         
-        # Build the target URL
-        target_url = f"{forward_url}"
+        # Build the target URL including the run path and flow id
+        base = (forward_url or "").rstrip("/")
+        if base.endswith("/api/v1/run"):
+            target_url = f"{base}/{flow_id_or_name}"
+        else:
+            target_url = f"{base}/api/v1/run/{flow_id_or_name}"
         if request.url.query:
             target_url += f"?{request.url.query}"
         
         logger.info(f"Forwarding flow request to: {target_url}")
         
         # Make the request to Nginx
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=None) as client:
+            # Stream if requested
+            if stream:
+                async with client.stream(
+                    method="POST",
+                    url=target_url,
+                    headers=headers,
+                    json=body_data,
+                ) as upstream:
+                    # Prepare a passthrough async generator
+                    async def iter_upstream_bytes():
+                        async for chunk in upstream.aiter_bytes():
+                            # yield raw bytes as they arrive (SSE/chunked)
+                            yield chunk
+
+                    # Filter hop-by-hop headers that should not be forwarded
+                    hop_by_hop = {
+                        "connection",
+                        "keep-alive",
+                        "proxy-authenticate",
+                        "proxy-authorization",
+                        "te",
+                        "trailers",
+                        "transfer-encoding",
+                        "upgrade",
+                        "content-length",
+                    }
+                    forward_headers = {
+                        k: v for k, v in upstream.headers.items() if k.lower() not in hop_by_hop
+                    }
+                    media_type = upstream.headers.get("content-type", "text/event-stream")
+
+                    return StreamingResponse(
+                        iter_upstream_bytes(),
+                        status_code=upstream.status_code,
+                        headers=forward_headers,
+                        media_type=media_type,
+                    )
+
+            # Non-streaming: buffer and return
             response = await client.post(
                 url=target_url,
                 headers=headers,
-                json=body_data
+                json=body_data,
             )
-            
-            # Return the response from Nginx
+
+            # Filter hop-by-hop headers
+            hop_by_hop = {
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailers",
+                "transfer-encoding",
+                "upgrade",
+                "content-length",
+            }
+            forward_headers = {k: v for k, v in response.headers.items() if k.lower() not in hop_by_hop}
+
             return Response(
                 content=response.content,
                 status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=response.headers.get("content-type")
+                headers=forward_headers,
+                media_type=response.headers.get("content-type"),
             )
             
     except Exception as e:
