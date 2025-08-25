@@ -94,45 +94,58 @@ async def forward_flow_request(request: Request, flow_id_or_name: str, input_req
         
         logger.info(f"Forwarding flow request to: {target_url}")
         
-        # Make the request to Nginx
-        async with httpx.AsyncClient(timeout=None) as client:
-            # Stream if requested
-            if stream:
-                async with client.stream(
-                    method="POST",
-                    url=target_url,
-                    headers=headers,
-                    json=body_data,
-                ) as upstream:
-                    # Prepare a passthrough async generator
-                    async def iter_upstream_bytes():
+        # Stream if requested
+        if stream:
+            # Create client that will be managed by the streaming generator
+            client = httpx.AsyncClient(timeout=None)
+            
+            # Prepare a passthrough async generator that manages both client and stream lifecycle
+            async def iter_upstream_bytes():
+                try:
+                    async with client.stream(
+                        method="POST",
+                        url=target_url,
+                        headers=headers,
+                        json=body_data,
+                    ) as upstream:
                         async for chunk in upstream.aiter_bytes():
                             # yield raw bytes as they arrive (SSE/chunked)
                             yield chunk
+                finally:
+                    # Ensure client is properly closed
+                    await client.aclose()
 
-                    # Filter hop-by-hop headers that should not be forwarded
-                    hop_by_hop = {
-                        "connection",
-                        "keep-alive",
-                        "proxy-authenticate",
-                        "proxy-authorization",
-                        "te",
-                        "trailers",
-                        "transfer-encoding",
-                        "upgrade",
-                        "content-length",
-                    }
-                    forward_headers = {
-                        k: v for k, v in upstream.headers.items() if k.lower() not in hop_by_hop
-                    }
-                    media_type = upstream.headers.get("content-type", "text/event-stream")
+            # Get response headers first for the StreamingResponse
+            # We need to make a HEAD request or handle this differently
+            # For now, let's use default headers and let the streaming handle the rest
+            hop_by_hop = {
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailers",
+                "transfer-encoding",
+                "upgrade",
+                "content-length",
+            }
+            
+            # Default headers for streaming response
+            forward_headers = {
+                "content-type": "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache",
+                "connection": "keep-alive",
+            }
 
-                    return StreamingResponse(
-                        iter_upstream_bytes(),
-                        status_code=upstream.status_code,
-                        headers=forward_headers,
-                        media_type=media_type,
-                    )
+            return StreamingResponse(
+                iter_upstream_bytes(),
+                status_code=200,
+                headers=forward_headers,
+                media_type="text/event-stream",
+            )
+        
+        # Non-streaming: use regular client context
+        async with httpx.AsyncClient(timeout=None) as client:
 
             # Non-streaming: buffer and return
             response = await client.post(
@@ -292,6 +305,7 @@ async def simple_run_flow_task(
 
     except Exception:  # noqa: BLE001
         logger.exception(f"Error running flow {flow.id} task")
+
 
 
 async def consume_and_yield(queue: asyncio.Queue, client_consumed_queue: asyncio.Queue) -> AsyncGenerator:
