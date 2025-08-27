@@ -12,7 +12,7 @@ import httpx
 import sqlalchemy as sa
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, RedirectResponse
 from loguru import logger
 from sqlmodel import select
 
@@ -435,17 +435,36 @@ async def simplified_run_flow(
     telemetry_service = get_telemetry_service()
     input_request = input_request if input_request is not None else SimplifiedAPIRequest()
     
-    # Check if forwarding is enabled and attempt to forward the request
-    forwarded_response = await forward_flow_request(
-        request=request,
-        flow_id_or_name=flow.id if flow else "",
-        input_request=input_request,
-        stream=stream,
-        api_key_user=api_key_user
-    )
+    # Check if forwarding is enabled and use RedirectResponse for forwarding
+    forward_flow = os.getenv("FORWARD_FLOW", "false").lower() == "true"
+    forward_url = os.getenv("FORWARD_FLOW_URL", "")
     
-    if forwarded_response:
-        return forwarded_response
+    if forward_flow and forward_url and flow:
+        # Build the target URL for redirection
+
+        base = (forward_url or "").rstrip("/")
+        flow_identifier = flow.endpoint_name or flow.id
+        if base.endswith("/api/v1/run"):
+            target_url = f"{base}/{flow_identifier}"
+        else:
+            target_url = f"{base}/api/v1/run/{flow_identifier}"
+        
+        # Preserve query parameters
+        if request.url.query:
+            target_url += f"?{request.url.query}"
+        
+        logger.info(f"Redirecting flow {flow.id} to: {target_url}")
+        
+        # Use RedirectResponse to forward the request
+        return RedirectResponse(
+            url=target_url,
+            status_code=307,
+            headers={
+                "X-Forwarded-Flow-ID": str(flow.id),
+                "X-Forwarded-Method": request.method,
+                "X-Original-Host": request.headers.get("host", ""),
+            }
+        )
     
     if flow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Flow not found")
@@ -526,6 +545,125 @@ async def simplified_run_flow(
     return result
 
 
+async def openai_request_parser(input_request: dict) -> SimplifiedAPIRequest:
+    """Convert OpenAI-compatible request to Langflow's SimplifiedAPIRequest format.
+    
+    This function processes OpenAI-compatible API requests by:
+    1. Extracting messages from the input_request  
+    2. Converting them to Langflow's format
+    3. Setting appropriate parameters for flow execution
+    
+    Args:
+        input_request: OpenAI-compatible request containing messages and parameters
+        
+    Returns:
+        SimplifiedAPIRequest: Converted request ready for Langflow processing
+    """
+    # Extract messages and convert to a single input value
+    # For chat flows, we typically want the latest user message as the primary input
+    messages = input_request.get("messages", [])
+    user_messages = [msg["content"] for msg in messages if msg.get("role") == "user"]
+    system_messages = [msg["content"] for msg in messages if msg.get("role") == "system"]
+    
+    # Use the last user message as the primary input, or combine if multiple
+    if user_messages:
+        input_value = user_messages[-1] if len(user_messages) == 1 else "\n".join(user_messages)
+    else:
+        input_value = ""
+    
+    # Create tweaks based on OpenAI parameters
+    tweaks = {}
+    if input_request.get("model"):
+        # If model is specified, we can use it to set tweaks for model components
+        tweaks["model"] = input_request["model"]
+    
+    if input_request.get("temperature") is not None:
+        tweaks["temperature"] = input_request["temperature"]
+        
+    if input_request.get("max_tokens") is not None:
+        tweaks["max_tokens"] = input_request["max_tokens"]
+    
+    # If there are system messages, add them to tweaks for prompt components
+    if system_messages:
+        tweaks["system_message"] = system_messages[0]  # Use first system message
+    
+    # Create the simplified request
+    simplified_request = SimplifiedAPIRequest(
+        input_value=input_value,
+        input_type="chat",
+        output_type="chat",
+        tweaks=tweaks,
+        session_id=None
+    )
+    
+    return simplified_request
+
+
+@router.post("/openai_run_flow", response_model=RunResponse)
+async def openai_run_flow(
+    *,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    input_request: dict = Body(...),
+    api_key_user: Annotated[UserRead, Depends(api_key_security)],
+) -> RunResponse:
+    """OpenAI Compatible API endpoint that processes requests and executes flows directly.
+    
+    This endpoint processes OpenAI-compatible API requests by:
+    1. Parsing the input_request according to OpenAI Compatible API format
+    2. Extracting messages from input_request and converting to Langflow format
+    3. Executing the flow directly using the converted parameters
+    
+    Args:
+        request: The incoming HTTP request
+        background_tasks: FastAPI background task manager
+        input_request: The request body containing OpenAI-compatible data
+        api_key_user: Authenticated user from API key
+        
+    Returns:
+        RunResponse: Flow execution results in Langflow format
+    """
+    try:
+        # Extract flow_id from model field (as per OpenAI format)
+        flow_id = input_request.get("model")
+        if not flow_id:
+            raise HTTPException(status_code=400, detail="Flow ID (model) is required")
+        
+        # Get the flow
+        flow = await get_flow_by_id_or_endpoint_name(flow_id, api_key_user.id)
+        if flow is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Flow {flow_id} not found"
+            )
+        
+        # Convert OpenAI request to Langflow format using OpenAI_Parser logic
+        simplified_request = await openai_request_parser(input_request)
+        
+        logger.info(f"OpenAI API executing flow {flow_id} directly")
+        
+        # Execute the flow using simple_run_flow
+        result = await simple_run_flow(
+            flow=flow,
+            input_request=simplified_request,
+            stream=False, 
+            api_key_user=api_key_user,
+        )
+
+        
+        return result
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"Error in OpenAI compatible API: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error executing flow: {str(e)}"
+        )
+
+
 @router.post("/webhook/{flow_id_or_name}", response_model=dict, status_code=HTTPStatus.ACCEPTED)  # noqa: RUF100, FAST003
 async def webhook_run_flow(
     flow: Annotated[Flow, Depends(get_flow_by_id_or_endpoint_name)],
@@ -551,17 +689,31 @@ async def webhook_run_flow(
     start_time = time.perf_counter()
     logger.debug("Received webhook request")
     
-    # Check if forwarding is enabled and attempt to forward the request
-    forwarded_response = await forward_flow_request(
-        request=request,
-        flow_id_or_name=flow.id if flow else "",
-        input_request=None,
-        stream=False,
-        api_key_user=user
-    )
+    # Check if forwarding is enabled and use RedirectResponse for forwarding
+    forward_flow = os.getenv("FORWARD_FLOW", "false").lower() == "true"
+    forward_url = os.getenv("FORWARD_FLOW_URL", "")
     
-    if forwarded_response:
-        return forwarded_response
+    if forward_flow and forward_url and flow:
+        # Build the target URL for webhook redirection
+        base = forward_url.rstrip("/")
+        target_url = f"{base}/api/v1/webhook/{flow.id}"
+        
+        # Preserve query parameters
+        if request.url.query:
+            target_url += f"?{request.url.query}"
+        
+        logger.info(f"Redirecting webhook for flow {flow.id} to: {target_url}")
+        
+        # Use RedirectResponse to forward the webhook request
+        return RedirectResponse(
+            url=target_url,
+            status_code=307,  # Temporary redirect, preserves method and body
+            headers={
+                "X-Forwarded-Flow-ID": str(flow.id),
+                "X-Forwarded-Method": request.method,
+                "X-Webhook-Redirect": "true",
+            }
+        )
     
     error_msg = ""
     try:

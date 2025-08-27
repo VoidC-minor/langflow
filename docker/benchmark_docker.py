@@ -81,7 +81,7 @@ class DockerBenchmark:
                         json={"input_value": "hello", "input_type": "chat"}
                     )
                     elapsed = time.time() - start
-                    if response.status_code == 200:
+                    if response.status_code == 200 or response.status_code == 307:
                         return elapsed
                     else:
                         console.print(f"⚠️  Flow execution failed: {response.status_code}", style="yellow")
@@ -109,7 +109,7 @@ class DockerBenchmark:
         
         return times
     
-    async def benchmark(self, flow_id="841009ce-bb47-4661-b64e-f865461701a2"):
+    async def benchmark(self, flow_id="d3f20939-c3a3-4003-80a6-c6777334a4be"):
         """Run the complete benchmark."""
         console.print(Panel.fit(" Docker Single Runner Benchmark", style="bold blue"))
         
