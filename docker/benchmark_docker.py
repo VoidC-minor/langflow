@@ -128,7 +128,6 @@ class DockerBenchmark:
             ("1 Flow", 1),
             ("50 Flows", 50),
             ("100 Flows", 100),
-            ("500 Flows", 500),
         ]
         
         for scenario_name, n_parallel in scenarios:

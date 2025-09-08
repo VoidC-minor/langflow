@@ -20,10 +20,12 @@ import json
 import os
 from typing import Dict, Any
 
+from test_streaming import get_available_flows
+
 # Configuration - adjust these values for your setup
 LANGFLOW_BASE_URL = os.getenv("LANGFLOW_BASE_URL", "http://localhost:7860")
 API_KEY = os.getenv("LANGFLOW_API_KEY", "")  
-FLOW_ID = os.getenv("LANGFLOW_FLOW_ID", "581f2884-3260-4982-ba08-bea27c14a857e")
+FLOW_ID = os.getenv("LANGFLOW_FLOW_ID", "41af00c8-b0ad-41b7-ab13-353cf9f0e958")
 
 # Test data in OpenAI-compatible format
 OPENAI_REQUEST_EXAMPLE = {
@@ -132,14 +134,23 @@ async def test_direct_flow_endpoint():
         headers["Authorization"] = f"Bearer {API_KEY}"
         headers["x-api-key"] = API_KEY
     
-    # Convert OpenAI format to Langflow format
+    # Convert OpenAI format to Langflow format (using working approach)
+    messages = OPENAI_REQUEST_EXAMPLE["messages"]
+    user_message = messages[-1]["content"]
+    system_message = next((msg["content"] for msg in messages if msg["role"] == "system"), "You are a helpful assistant.")
+    
     langflow_request = {
-        "input_value": OPENAI_REQUEST_EXAMPLE["messages"][-1]["content"],
         "input_type": "chat", 
         "output_type": "chat",
         "tweaks": {
-            "temperature": OPENAI_REQUEST_EXAMPLE.get("temperature", 0.7),
-            "max_tokens": OPENAI_REQUEST_EXAMPLE.get("max_tokens", 150)
+            "Prompt": {
+                "template": f"{system_message}\\n\\nUser: {user_message}\\nAssistant:"
+            },
+            # Configure OpenAI model with generic component name
+            "OpenAIModel": {
+                "temperature": OPENAI_REQUEST_EXAMPLE.get("temperature", 0.7),
+                "max_tokens": OPENAI_REQUEST_EXAMPLE.get("max_tokens", 150)
+            }
         }
     }
     
@@ -188,14 +199,22 @@ def test_request_parsing():
     print(f"User messages: {user_messages}")
     print(f"System messages: {system_messages}")
     
-    # Show the conversion to Langflow format
+    # Show the conversion to Langflow format (working approach)
+    user_message = user_messages[-1] if user_messages else ""
+    system_message = system_messages[0] if system_messages else "You are a helpful assistant."
+    
     langflow_format = {
-        "input_value": user_messages[-1] if user_messages else "",
         "input_type": "chat",
         "output_type": "chat", 
         "tweaks": {
-            "temperature": input_request.get("temperature"),
-            "max_tokens": input_request.get("max_tokens")
+            "Prompt": {
+                "template": f"{system_message}\\n\\nUser: {user_message}\\nAssistant:"
+            },
+            # Configure OpenAI model parameters
+            "OpenAIModel": {
+                "temperature": input_request.get("temperature"),
+                "max_tokens": input_request.get("max_tokens")
+            }
         }
     }
     
@@ -291,7 +310,7 @@ async def test_openai_flow_by_id():
 
 async def test_get_models():
     """Test the get models endpoint."""
-    print("\nTesting get models endpoint: /api/v1/v1/models")
+    print("\nTesting get models endpoint: /api/v1/models")
     
     headers = {
         "Content-Type": "application/json"
@@ -301,7 +320,7 @@ async def test_get_models():
         headers["Authorization"] = f"Bearer {API_KEY}"
         headers["x-api-key"] = API_KEY
     
-    url = f"{LANGFLOW_BASE_URL}/api/v1/v1/models"
+    url = f"{LANGFLOW_BASE_URL}/api/v1/models"
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -341,6 +360,9 @@ async def main():
         print("   export LANGFLOW_FLOW_ID=your-actual-flow-id")
         print("   export LANGFLOW_BASE_URL=http://your-langflow-instance:port")
         print()
+    
+    # Get available flows
+    flows = await get_available_flows()
     
     # Run tests
     test_request_parsing()

@@ -39,7 +39,7 @@ async def get_available_flows():
                 
                 if flows:
                     console.print("\n[cyan]Available flows:")
-                    for i, flow in enumerate(flows[:10], 1):
+                    for i, flow in enumerate(flows[:50], 1):
                         name = flow.get('name', 'Unnamed')
                         flow_id = flow.get('id', '')
                         console.print(f"  {i:2d}. {name} (ID: {flow_id})")

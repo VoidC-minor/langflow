@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import json
+import uuid
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Annotated
@@ -58,11 +60,19 @@ if TYPE_CHECKING:
 
 router = APIRouter(tags=["Base"])
 
+# Global forwarding configuration
+# - FORWARD_FLOW_ENABLED: enable forwarding logic
+# - FORWARD_FLOW_URL: base URL to forward/redirect to (e.g., http://nginx)
+# - FORWARD_FLOW_STRATEGY: 'redirect' (HTTP 307) or 'forward' (proxy request)
+FORWARD_FLOW_ENABLED = os.getenv("FORWARD_FLOW", "false").lower() == "true"
+FORWARD_FLOW_URL = os.getenv("FORWARD_FLOW_URL", "")
+FORWARD_FLOW_STRATEGY = os.getenv("FORWARD_FLOW_STRATEGY", "redirect").lower()
+
 
 async def forward_flow_request(request: Request, flow_id_or_name: str, input_request: SimplifiedAPIRequest | None = None, stream: bool = False, api_key_user: UserRead | None = None) -> Response:
     """Forward flow execution request to Nginx load balancer."""
-    forward_flow = os.getenv("FORWARD_FLOW", "false").lower() == "true"
-    forward_url = os.getenv("FORWARD_FLOW_URL", "")
+    forward_flow = FORWARD_FLOW_ENABLED
+    forward_url = FORWARD_FLOW_URL
     
     if not forward_flow or not forward_url:
         return None
@@ -180,6 +190,8 @@ async def forward_flow_request(request: Request, flow_id_or_name: str, input_req
         return None
 
 
+ 
+
 @router.get("/all", dependencies=[Depends(get_current_active_user)])
 async def get_all():
     """Retrieve all component types with compression for better performance.
@@ -238,6 +250,7 @@ async def simple_run_flow(
     event_manager: EventManager | None = None,
 ):
     validate_input_and_tweaks(input_request)
+    logger.info(f"Executing simple_run_flow for flow {flow.id} with stream={stream}, input_request={input_request}")
     try:
         task_result: list[RunOutputs] = []
         user_id = api_key_user.id if api_key_user else None
@@ -307,6 +320,55 @@ async def simple_run_flow_task(
         logger.exception(f"Error running flow {flow.id} task")
 
 
+def build_openai_chat_completion(result: RunResponse, model_id: str | None = None) -> dict:
+    """Convert internal RunResponse into OpenAI Chat Completions-compatible response."""
+    def coerce_to_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    contents: list[str] = []
+    if result and result.outputs:
+        for run_output in result.outputs:
+            for rd in (run_output.outputs or []):
+                if not rd:
+                    continue
+                if getattr(rd, "messages", None):
+                    for msg in rd.messages:
+                        text = coerce_to_text(getattr(msg, "message", None))
+                        if text:
+                            contents.append(text)
+                elif getattr(rd, "outputs", None):
+                    for ov in rd.outputs.values():
+                        message = ov.get("message") if isinstance(ov, dict) else getattr(ov, "message", None)
+                        text = coerce_to_text(message)
+                        if text:
+                            contents.append(text)
+                elif getattr(rd, "results", None) is not None:
+                    contents.append(coerce_to_text(rd.results))
+
+    content = "\n".join([c for c in contents if c]) if contents else ""
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_id or "langflow-flow",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+    }
+
 
 async def consume_and_yield(queue: asyncio.Queue, client_consumed_queue: asyncio.Queue) -> AsyncGenerator:
     """Consumes events from a queue and yields them to the client while tracking timing metrics.
@@ -375,6 +437,7 @@ async def run_flow_generator(
         - Always sends a final None event to signal completion
     """
     try:
+        logger.info(f"Starting flow generator for flow {flow.id} with input_request {input_request}")
         result = await simple_run_flow(
             flow=flow,
             input_request=input_request,
@@ -396,7 +459,7 @@ async def simplified_run_flow(
     *,
     request: Request,
     background_tasks: BackgroundTasks,
-    flow: Annotated[FlowRead | None, Depends(get_flow_by_id_or_endpoint_name)],
+    flow_id_or_name: str,
     input_request: SimplifiedAPIRequest | None = None,
     stream: bool = False,
     api_key_user: Annotated[UserRead, Depends(api_key_security)],
@@ -435,42 +498,42 @@ async def simplified_run_flow(
     telemetry_service = get_telemetry_service()
     input_request = input_request if input_request is not None else SimplifiedAPIRequest()
     
-    # Check if forwarding is enabled and use RedirectResponse for forwarding
-    forward_flow = os.getenv("FORWARD_FLOW", "false").lower() == "true"
-    forward_url = os.getenv("FORWARD_FLOW_URL", "")
-    
-    if forward_flow and forward_url and flow:
-        # Build the target URL for redirection
-
-        base = (forward_url or "").rstrip("/")
-        flow_identifier = flow.endpoint_name or flow.id
-        if base.endswith("/api/v1/run"):
-            target_url = f"{base}/{flow_identifier}"
+    # Early forwarding/redirect strategy
+    if FORWARD_FLOW_ENABLED and FORWARD_FLOW_URL:
+        if FORWARD_FLOW_STRATEGY == "forward":
+            forwarded = await forward_flow_request(
+                request=request,
+                flow_id_or_name=flow_id_or_name,
+                input_request=input_request,
+                stream=stream,
+                api_key_user=api_key_user,
+            )
+            if forwarded is not None:
+                return forwarded
         else:
-            target_url = f"{base}/api/v1/run/{flow_identifier}"
-        
-        # Preserve query parameters
-        if request.url.query:
-            target_url += f"?{request.url.query}"
-        
-        logger.info(f"Redirecting flow {flow.id} to: {target_url}")
-        
-        # Use RedirectResponse to forward the request
-        return RedirectResponse(
-            url=target_url,
-            status_code=307,
-            headers={
-                "X-Forwarded-Flow-ID": str(flow.id),
-                "X-Forwarded-Method": request.method,
-                "X-Original-Host": request.headers.get("host", ""),
-            }
-        )
-    
+            base = FORWARD_FLOW_URL.rstrip("/")
+            target_url = f"{base}/api/v1/run/{flow_id_or_name}"
+            if request.url.query:
+                target_url += f"?{request.url.query}"
+            logger.info(f"Redirecting flow request to: {target_url}")
+            resp = RedirectResponse(
+                url=target_url,
+                status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+            )
+            logger.info(
+                f"RedirectResponse prepared: status={resp.status_code} "
+                f"location={resp.headers.get('location')} method={request.method} path={request.url.path}"
+            )
+            return resp
+
+    # Resolve flow only when not forwarding
+    flow = await get_flow_by_id_or_endpoint_name(flow_id_or_name, api_key_user.id)
     if flow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Flow not found")
     start_time = time.perf_counter()
 
     if stream:
+        logger.info(f"Running flow {flow.id} with input_request {input_request} (streaming mode)")
         asyncio_queue: asyncio.Queue = asyncio.Queue()
         asyncio_queue_client_consumed: asyncio.Queue = asyncio.Queue()
         event_manager = create_stream_tokens_event_manager(queue=asyncio_queue)
@@ -495,6 +558,7 @@ async def simplified_run_flow(
         )
 
     try:
+        logger.info(f"Running flow {flow.id} with input_request {input_request}")
         result = await simple_run_flow(
             flow=flow,
             input_request=input_request,
@@ -545,68 +609,115 @@ async def simplified_run_flow(
     return result
 
 
-async def openai_request_parser(input_request: dict) -> SimplifiedAPIRequest:
+async def openai_request_parser(input_request: dict, flow_id: str = None) -> SimplifiedAPIRequest:
     """Convert OpenAI-compatible request to Langflow's SimplifiedAPIRequest format.
     
-    This function processes OpenAI-compatible API requests by:
-    1. Extracting messages from the input_request  
-    2. Converting them to Langflow's format
-    3. Setting appropriate parameters for flow execution
+    This function handles the ChatInput -> Prompt -> OpenAI -> ChatOutput flow by:
+    1. Bypassing problematic outdated ChatInput components
+    2. Setting the Prompt template directly with the complete conversation
+    3. Configuring OpenAI model parameters properly
+    4. Using component-specific targeting for reliability
     
     Args:
         input_request: OpenAI-compatible request containing messages and parameters
+        flow_id: Optional flow ID for flow-specific optimizations
         
     Returns:
         SimplifiedAPIRequest: Converted request ready for Langflow processing
     """
-    # Extract messages and convert to a single input value
-    # For chat flows, we typically want the latest user message as the primary input
+    # Extract messages
     messages = input_request.get("messages", [])
     user_messages = [msg["content"] for msg in messages if msg.get("role") == "user"]
     system_messages = [msg["content"] for msg in messages if msg.get("role") == "system"]
+    assistant_messages = [msg["content"] for msg in messages if msg.get("role") == "assistant"]
     
-    # Use the last user message as the primary input, or combine if multiple
-    if user_messages:
-        input_value = user_messages[-1] if len(user_messages) == 1 else "\n".join(user_messages)
-    else:
-        input_value = ""
+    # Get the user input
+    user_input = user_messages[-1] if user_messages else ""
+    system_prompt = system_messages[0] if system_messages else "You are a helpful assistant."
     
-    # Create tweaks based on OpenAI parameters
+    # Create tweaks for component targeting
     tweaks = {}
-    if input_request.get("model"):
-        # If model is specified, we can use it to set tweaks for model components
-        tweaks["model"] = input_request["model"]
     
+    # Configure OpenAI model parameters (keep as numbers for validation)
+    openai_params = {}
     if input_request.get("temperature") is not None:
-        tweaks["temperature"] = input_request["temperature"]
-        
+        openai_params["temperature"] = input_request["temperature"]
     if input_request.get("max_tokens") is not None:
-        tweaks["max_tokens"] = input_request["max_tokens"]
+        openai_params["max_tokens"] = input_request["max_tokens"]
+    if input_request.get("top_p") is not None:
+        openai_params["top_p"] = input_request["top_p"]
+    if input_request.get("frequency_penalty") is not None:
+        openai_params["frequency_penalty"] = input_request["frequency_penalty"]
+    if input_request.get("presence_penalty") is not None:
+        openai_params["presence_penalty"] = input_request["presence_penalty"]
+    if input_request.get("stop") is not None:
+        openai_params["stop"] = input_request["stop"]
     
-    # If there are system messages, add them to tweaks for prompt components
-    if system_messages:
-        tweaks["system_message"] = system_messages[0]  # Use first system message
+    # Apply to OpenAI components (use generic names only)
+    if openai_params:
+        tweaks["OpenAI"] = openai_params
+        tweaks["OpenAIModel"] = openai_params
+        tweaks["ChatOpenAI"] = openai_params
+        tweaks["OpenAIModelComponent"] = openai_params
     
-    # Create the simplified request
+
+    if user_input:
+        # Create a complete prompt template that doesn't rely on ChatInput
+        if system_prompt:
+            complete_template = f"{system_prompt}\\n\\nUser: {user_input}\\nAssistant:"
+        else:
+            complete_template = f"User: {user_input}\\nAssistant:"
+        
+        # Set the template directly on Prompt components
+        prompt_config = {"template": complete_template}
+        tweaks["Prompt"] = prompt_config
+        tweaks["PromptComponent"] = prompt_config
+    
+    # For ChatInput components, still try to set input_value for compatibility
+    # But since we're bypassing it with the Prompt template, this is secondary
+    if user_input:
+        chat_input_config = {"input_value": user_input}
+        tweaks["ChatInput"] = chat_input_config
+        tweaks["Chat Input"] = chat_input_config
+    
+    # Handle multi-turn conversations
+    if len(messages) > 2:
+        conversation_context = []
+        for msg in messages[:-1]:  # All messages except the last one
+            role = msg.get("role", "user").title()
+            content = msg.get("content", "")
+            conversation_context.append(f"{role}: {content}")
+        
+        # Include conversation history in the template
+        if conversation_context and user_input:
+            history = "\\n".join(conversation_context)
+            complete_template = f"{system_prompt}\\n\\nConversation History:\\n{history}\\n\\nUser: {user_input}\\nAssistant:"
+            
+            # Update all prompt components with history-aware template
+            prompt_config = {"template": complete_template}
+            tweaks["Prompt"] = prompt_config
+            tweaks["PromptComponent"] = prompt_config
+    
+    # Create simplified request - NO input_value to avoid conflicts
     simplified_request = SimplifiedAPIRequest(
-        input_value=input_value,
+        input_value=None,  # Critical: Set to None to avoid validation conflicts
         input_type="chat",
         output_type="chat",
         tweaks=tweaks,
-        session_id=None
+        session_id=input_request.get("session_id")
     )
     
     return simplified_request
 
 
-@router.post("/openai_run_flow", response_model=RunResponse)
+@router.post("/openai_run_flow", response_model=dict)
 async def openai_run_flow(
     *,
     request: Request,
     background_tasks: BackgroundTasks,
     input_request: dict = Body(...),
     api_key_user: Annotated[UserRead, Depends(api_key_security)],
-) -> RunResponse:
+) -> dict:
     """OpenAI Compatible API endpoint that processes requests and executes flows directly.
     
     This endpoint processes OpenAI-compatible API requests by:
@@ -638,20 +749,21 @@ async def openai_run_flow(
             )
         
         # Convert OpenAI request to Langflow format using OpenAI_Parser logic
-        simplified_request = await openai_request_parser(input_request)
+        simplified_request = await openai_request_parser(input_request, flow_id)
         
         logger.info(f"OpenAI API executing flow {flow_id} directly")
         
-        # Execute the flow using simple_run_flow
-        result = await simple_run_flow(
+        # Execute the flow using simplified_run_flow logic
+        result = await simplified_run_flow(
+            request=request,
+            background_tasks=background_tasks,
             flow=flow,
             input_request=simplified_request,
-            stream=False, 
+            stream=False,
             api_key_user=api_key_user,
         )
-
         
-        return result
+        return build_openai_chat_completion(result=result, model_id=flow_id)
         
     except HTTPException:
         # Re-raise HTTP exceptions as-is
@@ -664,12 +776,72 @@ async def openai_run_flow(
         )
 
 
-@router.post("/webhook/{flow_id_or_name}", response_model=dict, status_code=HTTPStatus.ACCEPTED)  # noqa: RUF100, FAST003
-async def webhook_run_flow(
-    flow: Annotated[Flow, Depends(get_flow_by_id_or_endpoint_name)],
-    user: Annotated[User, Depends(get_user_by_flow_id_or_endpoint_name)],
+@router.post("/openai_run_flow/{flow_id}", response_model=dict)
+async def openai_run_flow_by_id(
+    *,
     request: Request,
     background_tasks: BackgroundTasks,
+    flow_id: str,
+    input_request: dict = Body(...),
+    api_key_user: Annotated[UserRead, Depends(api_key_security)],
+) -> dict:
+    """Flow-specific OpenAI-compatible API endpoint.
+    
+    This endpoint allows running a specific flow using OpenAI-compatible format
+    without needing to specify the flow ID in the model field.
+    
+    Args:
+        request: The incoming HTTP request
+        background_tasks: FastAPI background task manager
+        flow_id: The flow ID from the URL path
+        input_request: The request body containing OpenAI-compatible data
+        api_key_user: Authenticated user from API key
+        
+    Returns:
+        RunResponse: Flow execution results in Langflow format
+    """
+    try:
+        # Get the flow
+        flow = await get_flow_by_id_or_endpoint_name(flow_id, api_key_user.id)
+        if flow is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Flow {flow_id} not found"
+            )
+        
+        # Convert OpenAI request to Langflow format using OpenAI_Parser logic
+        simplified_request = await openai_request_parser(input_request, flow_id)
+        
+        logger.info(f"OpenAI API executing flow {flow_id} directly (flow-specific endpoint)")
+        
+        # Execute the flow using simplified_run_flow logic
+        result = await simplified_run_flow(
+            request=request,
+            background_tasks=background_tasks,
+            flow=flow,
+            input_request=simplified_request,
+            stream=False,
+            api_key_user=api_key_user,
+        )
+        
+        return build_openai_chat_completion(result=result, model_id=flow_id)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in flow-specific OpenAI API: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error executing flow: {str(e)}"
+        )
+
+
+@router.post("/webhook/{flow_id_or_name}", response_model=dict, status_code=HTTPStatus.ACCEPTED)  # noqa: RUF100, FAST003
+async def webhook_run_flow(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    flow_id_or_name: str,
+    user: Annotated[User, Depends(get_user_by_flow_id_or_endpoint_name)],
 ):
     """Run a flow using a webhook request.
 
@@ -689,32 +861,8 @@ async def webhook_run_flow(
     start_time = time.perf_counter()
     logger.debug("Received webhook request")
     
-    # Check if forwarding is enabled and use RedirectResponse for forwarding
-    forward_flow = os.getenv("FORWARD_FLOW", "false").lower() == "true"
-    forward_url = os.getenv("FORWARD_FLOW_URL", "")
-    
-    if forward_flow and forward_url and flow:
-        # Build the target URL for webhook redirection
-        base = forward_url.rstrip("/")
-        target_url = f"{base}/api/v1/webhook/{flow.id}"
-        
-        # Preserve query parameters
-        if request.url.query:
-            target_url += f"?{request.url.query}"
-        
-        logger.info(f"Redirecting webhook for flow {flow.id} to: {target_url}")
-        
-        # Use RedirectResponse to forward the webhook request
-        return RedirectResponse(
-            url=target_url,
-            status_code=307,  # Temporary redirect, preserves method and body
-            headers={
-                "X-Forwarded-Flow-ID": str(flow.id),
-                "X-Forwarded-Method": request.method,
-                "X-Webhook-Redirect": "true",
-            }
-        )
-    
+    # Resolve flow only when not forwarding
+    flow = await get_flow_by_id_or_endpoint_name(flow_id_or_name, user.id)
     error_msg = ""
     try:
         try:
@@ -848,17 +996,6 @@ async def experimental_run_flow(
             tweaks=tweaks or {},
             session_id=session_id
         )
-    
-    forwarded_response = await forward_flow_request(
-        request=request,
-        flow_id_or_name=str(flow_id),
-        input_request=input_request,
-        stream=stream,
-        api_key_user=api_key_user
-    )
-    
-    if forwarded_response:
-        return forwarded_response
     
     session_service = get_session_service()
     flow_id_str = str(flow_id)
