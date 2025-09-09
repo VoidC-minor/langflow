@@ -661,8 +661,13 @@ async def openai_request_parser(input_request: dict, flow_id: str = None) -> Sim
     
     return simplified_request
 
-def build_openai_chat_completion(result: RunResponse, model_id: str | None = None) -> dict:
-    """Convert internal RunResponse into OpenAI Chat Completions-compatible response."""
+def build_openai_chat_completion(result: RunResponse | dict | Response | str | bytes | None, model_id: str | None = None) -> dict:
+    """Convert various flow results into an OpenAI Chat Completions-compatible response.
+
+    Accepts a RunResponse instance, a dict payload, a FastAPI/Starlette Response,
+    or raw JSON (str/bytes). Safely extracts assistant text content from the
+    nested structures produced by Langflow runs or forwarded responses.
+    """
     def coerce_to_text(value) -> str:
         if value is None:
             return ""
@@ -673,41 +678,118 @@ def build_openai_chat_completion(result: RunResponse, model_id: str | None = Non
                 return str(value)
         return str(value)
 
-    contents: list[str] = []
-    if result and result.outputs:
-        for run_output in result.outputs:
-            for rd in (run_output.outputs or []):
+    def extract_from_typed_outputs(outputs) -> list[str]:
+        texts: list[str] = []
+        for run_output in outputs or []:
+            for rd in (getattr(run_output, "outputs", None) or []):
                 if not rd:
                     continue
-                if getattr(rd, "messages", None):
-                    for msg in rd.messages:
+                # rd is ResultData
+                messages = getattr(rd, "messages", None)
+                if messages:
+                    for msg in messages:
                         text = coerce_to_text(getattr(msg, "message", None))
                         if text:
-                            contents.append(text)
-                elif getattr(rd, "outputs", None):
-                    for ov in rd.outputs.values():
+                            texts.append(text)
+                    continue
+                rd_outputs = getattr(rd, "outputs", None)
+                if isinstance(rd_outputs, dict):
+                    for ov in rd_outputs.values():
                         message = ov.get("message") if isinstance(ov, dict) else getattr(ov, "message", None)
                         text = coerce_to_text(message)
                         if text:
-                            contents.append(text)
-                elif getattr(rd, "results", None) is not None:
-                    contents.append(coerce_to_text(rd.results))
+                            texts.append(text)
+                    continue
+                if getattr(rd, "results", None) is not None:
+                    texts.append(coerce_to_text(getattr(rd, "results")))
+        return texts
+
+    def extract_from_dict_outputs(outputs_dict_list: list[dict]) -> list[str]:
+        texts: list[str] = []
+        for run_output in outputs_dict_list or []:
+            # run_output is expected to be a dict with an "outputs" key containing a list
+            rd_list = run_output.get("outputs") if isinstance(run_output, dict) else None
+            if not isinstance(rd_list, list):
+                continue
+            for rd in rd_list:
+                if not isinstance(rd, dict):
+                    continue
+                # messages path
+                if isinstance(rd.get("messages"), list):
+                    for msg in rd["messages"]:
+                        if isinstance(msg, dict):
+                            text = coerce_to_text(msg.get("message"))
+                            if text:
+                                texts.append(text)
+                    continue
+                # outputs path (dict of OutputValue-like)
+                if isinstance(rd.get("outputs"), dict):
+                    for ov in rd["outputs"].values():
+                        if isinstance(ov, dict):
+                            text = coerce_to_text(ov.get("message"))
+                            if text:
+                                texts.append(text)
+                    continue
+                # results fallback
+                if "results" in rd:
+                    texts.append(coerce_to_text(rd.get("results")))
+        return texts
+
+    # Normalize the incoming result into a dict or RunResponse
+    parsed_dict: dict | None = None
+
+    # If Response, try to parse JSON body
+    if isinstance(result, Response):
+        body_bytes = getattr(result, "body", None)
+        try:
+            if isinstance(body_bytes, (bytes, bytearray)) and body_bytes:
+                parsed_dict = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+        except Exception:
+            parsed_dict = None
+
+    # Raw str/bytes JSON
+    if parsed_dict is None and isinstance(result, (str, bytes, bytearray)):
+        try:
+            raw = result.decode("utf-8") if isinstance(result, (bytes, bytearray)) else result
+            parsed_dict = json.loads(raw)
+        except Exception:
+            parsed_dict = None
+
+    # Direct dict
+    if parsed_dict is None and isinstance(result, dict):
+        parsed_dict = result
+
+    contents: list[str] = []
+    if isinstance(result, RunResponse) and result.outputs:
+        contents.extend(extract_from_typed_outputs(result.outputs))
+    elif parsed_dict is not None:
+        outputs = parsed_dict.get("outputs") if isinstance(parsed_dict, dict) else None
+        if isinstance(outputs, list):
+            contents.extend(extract_from_dict_outputs(outputs))
 
     content = "\n".join([c for c in contents if c]) if contents else ""
 
     return {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
-        "object": "chat.completion",
+        "id": f"resp-{uuid.uuid4().hex}",
+        "object": "response",
         "created": int(time.time()),
         "model": model_id or "langflow-flow",
-        "choices": [
+        "status": "completed",
+        "output": [
             {
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": content,
+                        "annotations": [],
+                    }
+                ],
             }
         ],
-        "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+        "output_text": content,
+        "system_fingerprint": "langflow",
     }
 
 
@@ -759,8 +841,8 @@ async def openai_run_flow_by_id(
             api_key_user=api_key_user,
         )
         
-        # return build_openai_chat_completion(result=result, model_id=flow_id)
-        return result
+        return build_openai_chat_completion(result=result, model_id=flow_id)
+        # return result
         
     except HTTPException:
         raise

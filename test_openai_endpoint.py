@@ -25,7 +25,7 @@ from test_streaming import get_available_flows
 # Configuration - align with test_streaming.py, but keep compatibility
 LANGFLOW_URL = os.getenv("LANGFLOW_URL") or os.getenv("LANGFLOW_BASE_URL", "http://localhost:7860")
 API_KEY = os.getenv("LANGFLOW_API_KEY", "")
-FLOW_ID = os.getenv("LANGFLOW_FLOW_ID", "41af00c8-b0ad-41b7-ab13-353cf9f0e958")
+FLOW_ID = "ec8fd11e-ba02-45a2-8d13-a15aabb4e0a6"
 
 
 async def test_openai_flow_by_id(flow_id: str):
@@ -82,20 +82,15 @@ async def main():
     print()
 
     # Determine flow ID from CLI arg or prompt user after listing flows
-    flow_id = None
     if len(sys.argv) > 1:
         flow_id = sys.argv[1].strip()
         print(f"Using flow ID from command line: {flow_id}")
     else:
         # Show available flows to help the user choose
         await get_available_flows()
-        env_flow = os.getenv("LANGFLOW_FLOW_ID", "").strip()
         prompt = "Enter Flow ID to test"
-        if env_flow:
-            prompt += f" [default: {env_flow}]"
-        print()
         user_input = input(f"{prompt}: ").strip()
-        flow_id = user_input or env_flow
+        flow_id = user_input or FLOW_ID
 
     if not flow_id:
         print("No flow ID provided. Exiting.")
