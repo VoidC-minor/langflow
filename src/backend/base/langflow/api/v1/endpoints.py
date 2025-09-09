@@ -64,9 +64,9 @@ router = APIRouter(tags=["Base"])
 # - FORWARD_FLOW_ENABLED: enable forwarding logic
 # - FORWARD_FLOW_URL: base URL to forward/redirect to (e.g., http://nginx)
 # - FORWARD_FLOW_STRATEGY: 'redirect' (HTTP 307) or 'forward' (proxy request)
-FORWARD_FLOW_ENABLED = os.getenv("FORWARD_FLOW", "false").lower() == "true"
+FORWARD_FLOW_ENABLED = os.getenv("FORWARD_FLOW", "").lower() == "true"
 FORWARD_FLOW_URL = os.getenv("FORWARD_FLOW_URL", "")
-FORWARD_FLOW_STRATEGY = os.getenv("FORWARD_FLOW_STRATEGY", "redirect").lower()
+FORWARD_FLOW_STRATEGY = os.getenv("FORWARD_FLOW_STRATEGY", "forward").lower()
 
 
 async def forward_flow_request(request: Request, flow_id_or_name: str, input_request: SimplifiedAPIRequest | None = None, stream: bool = False, api_key_user: UserRead | None = None) -> Response:
@@ -250,7 +250,7 @@ async def simple_run_flow(
     event_manager: EventManager | None = None,
 ):
     validate_input_and_tweaks(input_request)
-    logger.info(f"Executing simple_run_flow for flow {flow.id} with stream={stream}, input_request={input_request}")
+    # logger.info(f"Executing simple_run_flow for flow {flow.id} with stream={stream}, input_request={input_request}")
     try:
         task_result: list[RunOutputs] = []
         user_id = api_key_user.id if api_key_user else None
@@ -318,56 +318,6 @@ async def simple_run_flow_task(
 
     except Exception:  # noqa: BLE001
         logger.exception(f"Error running flow {flow.id} task")
-
-
-def build_openai_chat_completion(result: RunResponse, model_id: str | None = None) -> dict:
-    """Convert internal RunResponse into OpenAI Chat Completions-compatible response."""
-    def coerce_to_text(value) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, (dict, list)):
-            try:
-                return json.dumps(value, ensure_ascii=False)
-            except Exception:
-                return str(value)
-        return str(value)
-
-    contents: list[str] = []
-    if result and result.outputs:
-        for run_output in result.outputs:
-            for rd in (run_output.outputs or []):
-                if not rd:
-                    continue
-                if getattr(rd, "messages", None):
-                    for msg in rd.messages:
-                        text = coerce_to_text(getattr(msg, "message", None))
-                        if text:
-                            contents.append(text)
-                elif getattr(rd, "outputs", None):
-                    for ov in rd.outputs.values():
-                        message = ov.get("message") if isinstance(ov, dict) else getattr(ov, "message", None)
-                        text = coerce_to_text(message)
-                        if text:
-                            contents.append(text)
-                elif getattr(rd, "results", None) is not None:
-                    contents.append(coerce_to_text(rd.results))
-
-    content = "\n".join([c for c in contents if c]) if contents else ""
-
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model_id or "langflow-flow",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
-    }
 
 
 async def consume_and_yield(queue: asyncio.Queue, client_consumed_queue: asyncio.Queue) -> AsyncGenerator:
@@ -501,6 +451,7 @@ async def simplified_run_flow(
     # Early forwarding/redirect strategy
     if FORWARD_FLOW_ENABLED and FORWARD_FLOW_URL:
         if FORWARD_FLOW_STRATEGY == "forward":
+            logger.info(f"Forwarding flow request to: {FORWARD_FLOW_URL} by strategy: {FORWARD_FLOW_STRATEGY}")
             forwarded = await forward_flow_request(
                 request=request,
                 flow_id_or_name=flow_id_or_name,
@@ -511,6 +462,7 @@ async def simplified_run_flow(
             if forwarded is not None:
                 return forwarded
         else:
+            logger.info(f"Redirecting flow request to: {FORWARD_FLOW_URL} by strategy: {FORWARD_FLOW_STRATEGY}")
             base = FORWARD_FLOW_URL.rstrip("/")
             target_url = f"{base}/api/v1/run/{flow_id_or_name}"
             if request.url.query:
@@ -558,7 +510,7 @@ async def simplified_run_flow(
         )
 
     try:
-        logger.info(f"Running flow {flow.id} with input_request {input_request}")
+        # logger.info(f"Running flow {flow.id} with input_request {input_request}")
         result = await simple_run_flow(
             flow=flow,
             input_request=input_request,
@@ -709,71 +661,54 @@ async def openai_request_parser(input_request: dict, flow_id: str = None) -> Sim
     
     return simplified_request
 
+def build_openai_chat_completion(result: RunResponse, model_id: str | None = None) -> dict:
+    """Convert internal RunResponse into OpenAI Chat Completions-compatible response."""
+    def coerce_to_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except Exception:
+                return str(value)
+        return str(value)
 
-@router.post("/openai_run_flow", response_model=dict)
-async def openai_run_flow(
-    *,
-    request: Request,
-    background_tasks: BackgroundTasks,
-    input_request: dict = Body(...),
-    api_key_user: Annotated[UserRead, Depends(api_key_security)],
-) -> dict:
-    """OpenAI Compatible API endpoint that processes requests and executes flows directly.
-    
-    This endpoint processes OpenAI-compatible API requests by:
-    1. Parsing the input_request according to OpenAI Compatible API format
-    2. Extracting messages from input_request and converting to Langflow format
-    3. Executing the flow directly using the converted parameters
-    
-    Args:
-        request: The incoming HTTP request
-        background_tasks: FastAPI background task manager
-        input_request: The request body containing OpenAI-compatible data
-        api_key_user: Authenticated user from API key
-        
-    Returns:
-        RunResponse: Flow execution results in Langflow format
-    """
-    try:
-        # Extract flow_id from model field (as per OpenAI format)
-        flow_id = input_request.get("model")
-        if not flow_id:
-            raise HTTPException(status_code=400, detail="Flow ID (model) is required")
-        
-        # Get the flow
-        flow = await get_flow_by_id_or_endpoint_name(flow_id, api_key_user.id)
-        if flow is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Flow {flow_id} not found"
-            )
-        
-        # Convert OpenAI request to Langflow format using OpenAI_Parser logic
-        simplified_request = await openai_request_parser(input_request, flow_id)
-        
-        logger.info(f"OpenAI API executing flow {flow_id} directly")
-        
-        # Execute the flow using simplified_run_flow logic
-        result = await simplified_run_flow(
-            request=request,
-            background_tasks=background_tasks,
-            flow=flow,
-            input_request=simplified_request,
-            stream=False,
-            api_key_user=api_key_user,
-        )
-        
-        return build_openai_chat_completion(result=result, model_id=flow_id)
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions as-is
-        raise
-    except Exception as e:
-        logger.error(f"Error in OpenAI compatible API: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error executing flow: {str(e)}"
-        )
+    contents: list[str] = []
+    if result and result.outputs:
+        for run_output in result.outputs:
+            for rd in (run_output.outputs or []):
+                if not rd:
+                    continue
+                if getattr(rd, "messages", None):
+                    for msg in rd.messages:
+                        text = coerce_to_text(getattr(msg, "message", None))
+                        if text:
+                            contents.append(text)
+                elif getattr(rd, "outputs", None):
+                    for ov in rd.outputs.values():
+                        message = ov.get("message") if isinstance(ov, dict) else getattr(ov, "message", None)
+                        text = coerce_to_text(message)
+                        if text:
+                            contents.append(text)
+                elif getattr(rd, "results", None) is not None:
+                    contents.append(coerce_to_text(rd.results))
+
+    content = "\n".join([c for c in contents if c]) if contents else ""
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_id or "langflow-flow",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+    }
 
 
 @router.post("/openai_run_flow/{flow_id}", response_model=dict)
@@ -818,13 +753,14 @@ async def openai_run_flow_by_id(
         result = await simplified_run_flow(
             request=request,
             background_tasks=background_tasks,
-            flow=flow,
+            flow_id_or_name=flow_id,
             input_request=simplified_request,
             stream=False,
             api_key_user=api_key_user,
         )
         
-        return build_openai_chat_completion(result=result, model_id=flow_id)
+        # return build_openai_chat_completion(result=result, model_id=flow_id)
+        return result
         
     except HTTPException:
         raise

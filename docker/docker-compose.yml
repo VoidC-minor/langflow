@@ -9,10 +9,11 @@ services:
     container_name: langflow-main
     environment:
       - FORWARD_FLOW=true
-      - FORWARD_FLOW_URL=http://localhost:8080
+      - FORWARD_FLOW_URL=http://nginx:8080
       - LANGFLOW_LOCAL_MODE=true
       - LANGFLOW_AUTO_LOGIN=true
       - LANGFLOW_LOG_LEVEL=info
+      - FORWARD_FLOW_STRATEGY=forward
       - LANGFLOW_DATABASE_URL=postgresql+psycopg://langflow:langflow@postgres:5432/langflow
     ports:
       - "7860:7860"
