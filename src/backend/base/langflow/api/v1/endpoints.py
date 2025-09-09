@@ -470,7 +470,12 @@ async def simplified_run_flow(
             logger.info(f"Redirecting flow request to: {target_url}")
             resp = RedirectResponse(
                 url=target_url,
-                status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+                status_code=307,  # Temporary redirect, preserves method and body
+                headers={
+                    "X-Forwarded-Flow-ID": str(flow.id),
+                    "X-Forwarded-Method": request.method,
+                    "X-Webhook-Redirect": "true",
+                }
             )
             logger.info(
                 f"RedirectResponse prepared: status={resp.status_code} "
