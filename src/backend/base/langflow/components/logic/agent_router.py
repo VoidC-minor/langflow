@@ -9,14 +9,13 @@ from langflow.schema.message import Message
 
 class AgentRouterComponent(Component):
     display_name = "Agent Router"
-    description = "Routes tasks to different specialized agents based on agent descriptions and capabilities."
+    description = "Routes tasks to different specialized agents using a classifier LLM and returns the result from the selected agent."
     documentation: str = "https://docs.langflow.org/components-logic#agent-router"
     icon = "users"
     name = "AgentRouter"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.__iteration_updated = False
         self._routing_plan = ""
 
     inputs = [
@@ -27,8 +26,8 @@ class AgentRouterComponent(Component):
             required=True,
         ),
         HandleInput(
-            name="router_llm",
-            display_name="Router LLM",
+            name="classifier_llm",
+            display_name="Classifier LLM",
             input_types=["LanguageModel"],
             required=True,
             info="LLM that will analyze the task and decide which agent should handle it.",
@@ -45,65 +44,30 @@ class AgentRouterComponent(Component):
             display_name="Agent A",
             input_types=["LanguageModel"],
             info="First specialized agent (e.g., data analysis agent).",
-            advanced=True,
         ),
         HandleInput(
             name="agent_b",
             display_name="Agent B",
             input_types=["LanguageModel"],
             info="Second specialized agent (e.g., creative agent).",
-            advanced=True,
         ),
         HandleInput(
             name="agent_c",
             display_name="Agent C",
             input_types=["LanguageModel"],
             info="Third specialized agent (e.g., database agent).",
-            advanced=True,
         ),
         HandleInput(
             name="fallback_agent",
             display_name="Fallback Agent",
             input_types=["LanguageModel"],
             info="Fallback agent for tasks that don't match any specific agent.",
-            advanced=True,
         ),
         BoolInput(
             name="return_plan",
             display_name="Return Routing Plan",
             info="If true, returns the routing decision and plan along with the result.",
             value=False,
-            advanced=True,
-        ),
-        MessageInput(
-            name="agent_a_message",
-            display_name="Agent A Custom Message",
-            info="Optional custom message to pass to Agent A.",
-            advanced=True,
-        ),
-        MessageInput(
-            name="agent_b_message",
-            display_name="Agent B Custom Message",
-            info="Optional custom message to pass to Agent B.",
-            advanced=True,
-        ),
-        MessageInput(
-            name="agent_c_message",
-            display_name="Agent C Custom Message",
-            info="Optional custom message to pass to Agent C.",
-            advanced=True,
-        ),
-        MessageInput(
-            name="fallback_message",
-            display_name="Fallback Custom Message",
-            info="Optional custom message to pass to fallback agent.",
-            advanced=True,
-        ),
-        IntInput(
-            name="max_iterations",
-            display_name="Max Iterations",
-            info="Maximum number of iterations to prevent infinite loops.",
-            value=10,
             advanced=True,
         ),
         DropdownInput(
@@ -117,14 +81,10 @@ class AgentRouterComponent(Component):
     ]
 
     outputs = [
-        Output(display_name="Agent A", name="agent_a", method="agent_a_response", group_outputs=True),
-        Output(display_name="Agent B", name="agent_b", method="agent_b_response", group_outputs=True),
-        Output(display_name="Agent C", name="agent_c", method="agent_c_response", group_outputs=True),
-        Output(display_name="Fallback", name="fallback", method="fallback_response", group_outputs=True),
+        Output(display_name="Result", name="result", method="route_and_execute"),
     ]
 
     def _pre_run_setup(self):
-        self.__iteration_updated = False
         self._routing_plan = ""
 
     def parse_agent_descriptions(self) -> dict[str, Any]:
@@ -181,10 +141,10 @@ Important: Respond ONLY with the JSON object, no additional text."""
         return prompt
 
     async def route_task(self) -> tuple[str, str, str]:
-        """Use router LLM to determine which agent should handle the task."""
-        if not self.router_llm:
-            self.log("No router LLM provided, using default agent", "warning")
-            return self.default_agent, "No router LLM available", self.input_task
+        """Use classifier LLM to determine which agent should handle the task."""
+        if not self.classifier_llm:
+            self.log("No classifier LLM provided, using default agent", "warning")
+            return self.default_agent, "No classifier LLM available", self.input_task
         
         agents = self.parse_agent_descriptions()
         if not agents:
@@ -198,11 +158,11 @@ Important: Respond ONLY with the JSON object, no additional text."""
             system_message = {"role": "system", "content": system_prompt}
             user_message = {"role": "user", "content": f"Task to route: {self.input_task}"}
             
-            self.log("Requesting routing decision from router LLM...")
+            self.log("Requesting routing decision from classifier LLM...")
             self.status = "Analyzing task and selecting agent..."
             
-            # Get response from router LLM
-            response = await self.router_llm.ainvoke([system_message, user_message])
+            # Get response from classifier LLM
+            response = await self.classifier_llm.ainvoke([system_message, user_message])
             routing_response = response.content.strip()
             
             # Parse the JSON response
@@ -263,18 +223,6 @@ Important: Respond ONLY with the JSON object, no additional text."""
         else:
             return None
 
-    def get_custom_message(self, route_name: str) -> Message:
-        """Get the custom message for a given route."""
-        if route_name == "agent_a" and self.agent_a_message:
-            return self.agent_a_message
-        elif route_name == "agent_b" and self.agent_b_message:
-            return self.agent_b_message
-        elif route_name == "agent_c" and self.agent_c_message:
-            return self.agent_c_message
-        elif route_name == "fallback" and self.fallback_message:
-            return self.fallback_message
-        else:
-            return Message(content="")
 
     async def execute_with_agent(self, route_name: str, task: str) -> Message:
         """Execute the task with the selected agent."""
@@ -285,15 +233,11 @@ Important: Respond ONLY with the JSON object, no additional text."""
             return Message(content=task)
         
         try:
-            # Use custom message if available, otherwise use the routed task
-            custom_message = self.get_custom_message(route_name)
-            input_text = custom_message.content if custom_message.content else task
-            
             self.log(f"Executing task with {route_name} agent...")
             self.status = f"Processing with {route_name} agent..."
             
             # Execute with the selected agent
-            input_message_obj = Message(text=input_text)
+            input_message_obj = Message(text=task)
             result = get_chat_result(
                 runnable=agent,
                 input_value=input_message_obj,
@@ -316,62 +260,18 @@ Important: Respond ONLY with the JSON object, no additional text."""
             # Fallback to task text
             return Message(content=task)
 
-    def iterate_and_stop_once(self, route_to_stop: str):
-        """Handle iteration counting and stopping to prevent infinite loops."""
-        if not self.__iteration_updated:
-            self.update_ctx({f"{self._id}_iteration": self.ctx.get(f"{self._id}_iteration", 0) + 1})
-            self.__iteration_updated = True
-            
-            # Check if we've exceeded max iterations
-            if self.ctx.get(f"{self._id}_iteration", 0) >= self.max_iterations:
-                self.log(f"Max iterations ({self.max_iterations}) reached, using default agent", "warning")
-                route_to_stop = self.default_agent
-            
-            self.stop(route_to_stop)
 
-    async def agent_a_response(self) -> Message:
-        """Handle Agent A output."""
+    async def route_and_execute(self) -> Message:
+        """Route the task to the appropriate agent and return the result."""
         selected_agent, reason, task = await self.route_task()
-        if selected_agent == "agent_a":
-            self.status = f"Routed to Agent A - {reason}"
-            result = await self.execute_with_agent("agent_a", task)
-            self.iterate_and_stop_once("agent_b")  # Stop other routes
-            return result
-        self.iterate_and_stop_once("agent_a")  # Stop this route
-        return Message(content="")
-
-    async def agent_b_response(self) -> Message:
-        """Handle Agent B output."""
-        selected_agent, reason, task = await self.route_task()
-        if selected_agent == "agent_b":
-            self.status = f"Routed to Agent B - {reason}"
-            result = await self.execute_with_agent("agent_b", task)
-            self.iterate_and_stop_once("agent_c")  # Stop other routes
-            return result
-        self.iterate_and_stop_once("agent_b")  # Stop this route
-        return Message(content="")
-
-    async def agent_c_response(self) -> Message:
-        """Handle Agent C output."""
-        selected_agent, reason, task = await self.route_task()
-        if selected_agent == "agent_c":
-            self.status = f"Routed to Agent C - {reason}"
-            result = await self.execute_with_agent("agent_c", task)
-            self.iterate_and_stop_once("fallback")  # Stop other routes
-            return result
-        self.iterate_and_stop_once("agent_c")  # Stop this route
-        return Message(content="")
-
-    async def fallback_response(self) -> Message:
-        """Handle Fallback output."""
-        selected_agent, reason, task = await self.route_task()
-        if selected_agent == "fallback":
-            self.status = f"Routed to Fallback - {reason}"
-            result = await self.execute_with_agent("fallback", task)
-            self.iterate_and_stop_once("agent_a")  # Stop other routes
-            return result
-        self.iterate_and_stop_once("fallback")  # Stop this route
-        return Message(content="")
+        
+        self.status = f"Routed to {selected_agent} - {reason}"
+        self.log(f"Task routed to {selected_agent}: {reason}")
+        
+        # Execute with the selected agent
+        result = await self.execute_with_agent(selected_agent, task)
+        
+        return result
 
     def update_build_config(self, build_config: dict, field_value: str, field_name: str | None = None) -> dict:
         """Update build configuration based on field changes."""
